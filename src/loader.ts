@@ -1,7 +1,7 @@
 import { readFile, mkdir, writeFile } from "fs/promises";
 import { join } from "path";
 import { randomUUID } from "crypto";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { getModel } from "@mariozechner/pi-ai";
 import type { Model } from "@mariozechner/pi-ai";
 import yaml from "js-yaml";
@@ -117,8 +117,10 @@ async function ensureGitagentDir(agentDir: string): Promise<string> {
 	return gitagentDir;
 }
 
-async function writeSessionState(gitagentDir: string): Promise<string> {
-	const sessionId = randomUUID();
+async function writeSessionState(gitagentDir: string, override?: string): Promise<string> {
+	// A caller-supplied id wins so an embedding host (Studio, a web UI, a test)
+	// can tie this run to a session it already knows about.
+	const sessionId = override || randomUUID();
 	const state = {
 		session_id: sessionId,
 		started_at: new Date().toISOString(),
@@ -162,6 +164,24 @@ function deepMerge(base: Record<string, any>, override: Record<string, any>): Re
 	return result;
 }
 
+/**
+ * Clone a git repo using argv (no shell). The URL/branch come from an untrusted
+ * agent.yaml, so they must never be interpolated into a shell string — that was
+ * a load-time RCE (`extends: "$(cmd)"`). Returns false on failure instead of
+ * throwing (preserves the old `|| true` continue-on-failure behavior).
+ */
+export function cloneGitRepo(url: string, dest: string, opts: { cwd: string; branch?: string }): boolean {
+	const args = ["clone", "--depth", "1"];
+	if (opts.branch) args.push("--branch", opts.branch);
+	args.push(url, dest);
+	try {
+		execFileSync("git", args, { cwd: opts.cwd, stdio: "pipe" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 async function resolveInheritance(
 	manifest: AgentManifest,
 	agentDir: string,
@@ -178,12 +198,7 @@ async function resolveInheritance(
 	const parentName = manifest.extends.split("/").pop()?.replace(/\.git$/, "") || "parent";
 	const parentDir = join(depsDir, parentName);
 
-	try {
-		execSync(`git clone --depth 1 "${manifest.extends}" "${parentDir}" 2>/dev/null || true`, {
-			cwd: agentDir,
-			stdio: "pipe",
-		});
-	} catch {
+	if (!cloneGitRepo(manifest.extends, parentDir, { cwd: agentDir })) {
 		// Clone failed, continue without parent
 		return { manifest, parentRules: "" };
 	}
@@ -224,14 +239,8 @@ async function resolveDependencies(
 
 	for (const dep of manifest.dependencies) {
 		const depDir = join(depsDir, dep.name);
-		try {
-			execSync(
-				`git clone --depth 1 --branch "${dep.version}" "${dep.source}" "${depDir}" 2>/dev/null || true`,
-				{ cwd: agentDir, stdio: "pipe" },
-			);
-		} catch {
-			// Clone failed, skip this dependency
-		}
+		// Clone failure is non-fatal; skip this dependency.
+		cloneGitRepo(dep.source, depDir, { cwd: agentDir, branch: dep.version });
 	}
 }
 
@@ -239,6 +248,7 @@ export async function loadAgent(
 	agentDir: string,
 	modelFlag?: string,
 	envFlag?: string,
+	sessionIdOverride?: string,
 ): Promise<LoadedAgent> {
 	// Parse agent.yaml
 	const manifestRaw = await readFile(join(agentDir, "agent.yaml"), "utf-8");
@@ -249,7 +259,7 @@ export async function loadAgent(
 
 	// Ensure .gitagent/ directory and write session state
 	const gitagentDir = await ensureGitagentDir(agentDir);
-	const sessionId = await writeSessionState(gitagentDir);
+	const sessionId = await writeSessionState(gitagentDir, sessionIdOverride);
 
 	// Resolve inheritance (Phase 2.4)
 	let parentRules = "";
@@ -404,6 +414,19 @@ Do NOT track trivial single-command tasks (e.g. "what time is it"). But DO check
 		// Standard registered model
 		model = getModel(provider as any, modelId as any);
 	}
+
+	// One run is many model requests: every turn of the agent loop, plus the
+	// off-loop reflection, repair and compaction calls. A gateway that groups
+	// telemetry per request sees each of those as a separate session unless the
+	// client says otherwise, so carry this run's id on every request.
+	//
+	// Cloned rather than mutated — getModel() returns a shared registry object,
+	// and writing to it would leak this run's id into every other model built in
+	// the same process.
+	model = {
+		...model,
+		headers: { ...(model as any).headers, "X-Session-Id": sessionId },
+	};
 
 	// For custom providers not in pi-ai's env key map, ensure an API key is available.
 	// pi-ai calls getEnvApiKey(model.provider) which only knows built-in providers.

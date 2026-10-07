@@ -1,5 +1,5 @@
 import { Agent } from "@mariozechner/pi-agent-core";
-import type { AgentEvent, AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentEvent, AgentTool, AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import { loadAgent } from "./loader.js";
 import type { AgentManifest } from "./loader.js";
@@ -29,6 +29,7 @@ import { context as otelContext } from "@opentelemetry/api";
 import {
 	wrapToolWithOtel,
 	startSessionSpan,
+	startTurnTrace,
 	recordGenAiCall,
 } from "./telemetry.js";
 
@@ -100,6 +101,8 @@ export function query(options: QueryOptions): Query {
 	// These are set once the agent is loaded (async init below)
 	let _sessionId = options.sessionId ?? "";
 	let _manifest: AgentManifest | null = null;
+	// Reference to the live engine so abort()/steer() actually reach it.
+	let agentRef: Agent | null = null;
 
 	// Accumulate streaming deltas for the current message
 	let accText = "";
@@ -160,7 +163,10 @@ export function query(options: QueryOptions): Query {
 		}
 
 		// 1. Load agent
-		const loaded = await loadAgent(dir, options.model, options.env);
+		// options.sessionId, when given, becomes the agent's session id — so a host
+		// that already tracks a conversation sees its own id on the model requests
+		// rather than a fresh one per run.
+		const loaded = await loadAgent(dir, options.model, options.env, options.sessionId);
 		_manifest = loaded.manifest;
 		_sessionId = _sessionId || loaded.sessionId;
 
@@ -324,7 +330,10 @@ export function query(options: QueryOptions): Query {
 				...modelOptions,
 			},
 		});
-		const forwardAbort = () => agent.abort();
+		agentRef = agent;
+		const forwardAbort = () => {
+			try { agent.abort(); } catch { /* already stopped */ }
+		};
 		ac.signal.addEventListener("abort", forwardAbort, { once: true });
 		removeAbortForwarder = () => ac.signal.removeEventListener("abort", forwardAbort);
 
@@ -571,6 +580,7 @@ export function query(options: QueryOptions): Query {
 					return;
 				}
 			}
+			startTurnTrace(loaded.model);
 			await promptWithTimeout(options.prompt as string);
 			if (ac.signal.aborted) {
 				finishAbortedQuery();
@@ -601,6 +611,7 @@ export function query(options: QueryOptions): Query {
 						return;
 					}
 				}
+				startTurnTrace(loaded.model);
 				await promptWithTimeout(userMsg.content);
 				if (ac.signal.aborted) {
 					finishAbortedQuery();
@@ -609,30 +620,25 @@ export function query(options: QueryOptions): Query {
 			}
 		}
 
-		// Finalize local session if active
-		if (localSession) {
-			try { localSession.finalize(); } catch { /* best-effort */ }
-		}
-
-		// Stop sandbox if active
-		if (sandboxCtx) {
-			await sandboxCtx.gitMachine.stop().catch(() => {});
-		}
-
 		// Ensure channel finishes even if no agent_end event
 		channel.finish();
 		} finally {
 			removeAbortForwarder?.();
 			removeAbortForwarder = undefined;
-			// Tear down MCP servers on every exit path — success, hook-block
-			// early-return, abort, and error (this finally runs before the
-			// .catch() handler below). cleanup() is idempotent.
+			// Cleanup on EVERY exit path — success, hook-block early-return, abort,
+			// and error (this finally runs before the .catch() below). Previously
+			// finalize/sandbox-stop lived only on the success and error paths, so a
+			// blocking hook leaked the sandbox VM and left the PAT in .git/config.
+			// All of these are idempotent / best-effort.
+			if (localSession) {
+				try { localSession.finalize(); } catch { /* best-effort */ }
+			}
+			if (sandboxCtx) {
+				await sandboxCtx.gitMachine.stop().catch(() => {});
+			}
 			if (mcpSetup) {
 				try { await mcpSetup.cleanup(); } catch { /* best-effort */ }
 			}
-			// Close the session span on every exit path — success, hook-block
-			// early-return, and the .catch() handler below (rethrow so this
-			// runs first).
 			try {
 				_session.end({ "gitagent.cost_usd": _totalCostUsd });
 			} catch {
@@ -640,15 +646,8 @@ export function query(options: QueryOptions): Query {
 			}
 		}
 	})().catch(async (err) => {
-		// Finalize local session on error
-		if (localSession) {
-			try { localSession.finalize(); } catch { /* best-effort */ }
-		}
-
-		// Stop sandbox on error
-		if (sandboxCtx) {
-			await sandboxCtx.gitMachine.stop().catch(() => {});
-		}
+		// Session finalize + sandbox stop already ran in the finally above (which
+		// executes before this .catch). Just surface the error.
 
 		// Fire on_error hooks
 		if (options.hooks?.onError) {
@@ -673,7 +672,10 @@ export function query(options: QueryOptions): Query {
 			abortQuery();
 		},
 
-		steer(_message: string) {
+		steer(message: string) {
+			// Queue a user message to be injected after the current tool batch —
+			// the engine drains it between turns. Was a no-op before.
+			agentRef?.steer({ role: "user", content: message } as AgentMessage);
 		},
 
 		sessionId() {
@@ -699,11 +701,14 @@ export function query(options: QueryOptions): Query {
 		},
 
 		return(value?: any) {
+			// Breaking out of `for await` cancels the agent (was: kept running).
+			ac.abort();
 			channel.finish();
 			return Promise.resolve({ value, done: true as const });
 		},
 
 		throw(err?: any) {
+			ac.abort();
 			channel.finish();
 			return Promise.reject(err);
 		},
